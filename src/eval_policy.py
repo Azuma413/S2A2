@@ -11,6 +11,7 @@ from lerobot.policies.pi0.modeling_pi0 import PI0Policy
 from lerobot.policies.vqbet.modeling_vqbet import VQBeTPolicy
 from lerobot.policies.factory import make_pre_post_processors
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.raw_audio_dataset import RawAudioLeRobotDataset, has_raw_audio
 from lerobot.utils.control_utils import predict_action
 from lerobot.datasets.utils import build_dataset_frame
 from lerobot.utils.constants import OBS_STR
@@ -224,7 +225,9 @@ def main(training_name, observation_height, observation_width, episode_num, show
     dataset_path = Path(f"datasets/{dataset_name}")
     dataset_path = dataset_path.resolve()
     print(f"Loading dataset from: {dataset_path}")
-    dataset = LeRobotDataset(str(dataset_path))
+    # 生波形付きデータセットは observation.audio を合成する派生クラスで読む
+    dataset_cls = RawAudioLeRobotDataset if has_raw_audio(dataset_path) else LeRobotDataset
+    dataset = dataset_cls(str(dataset_path))
     
     # Create preprocessor and postprocessor
     print("Creating preprocessor and postprocessor...")

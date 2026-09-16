@@ -20,6 +20,7 @@ def build_sound_config_from_task(task, use_legacy_sound_config=False):
 
     use_spectrogram = False
     use_soundmap = True
+    use_raw_audio = False
     if s == 0:
         mic_array_num = 0
         use_soundmap = False
@@ -30,6 +31,14 @@ def build_sound_config_from_task(task, use_legacy_sound_config=False):
     elif s == 3:
         use_spectrogram = True
         use_soundmap = False
+    elif s == 4:
+        # 視覚 + 生波形（音環境マップもスペクトログラムも使わない）
+        use_soundmap = False
+        use_raw_audio = True
+
+    # -w<N> で生波形の窓長[サンプル]を上書き（既定は1秒 = 16000）
+    window_match = re.search(r"-w(\d+)", task)
+    raw_audio_window = int(window_match.group(1)) if window_match else 16000
 
     use_gaussian_filter = False
     use_temporal_smoothing = False
@@ -92,6 +101,8 @@ def build_sound_config_from_task(task, use_legacy_sound_config=False):
         "noise_use_opposite_sound": noise_use_opposite_sound,
         "noise_source_radius": noise_source_radius,
         "spectrogram_mode": spectrogram_mode,
+        "use_raw_audio": use_raw_audio,
+        "raw_audio_window": raw_audio_window,
     }
     if use_legacy_sound_config:
         config_kwargs.update(

@@ -95,6 +95,66 @@ class SoundConfig:
     # Trueなら全モード(0,1,2)のスペクトログラムを毎フレーム生成して保持する
     # （1回のシミュレーションで3種類のデータセットを作るためのモード）
     spectrogram_all_modes: bool = False
+    # 生波形（全マイクの生信号）観測
+    use_raw_audio: bool = False
+    raw_audio_window: int = 16000  # 観測として返す直近サンプル数（fs=16000なら1.0秒）
+    raw_audio_crossfade: int = 128  # 更新境界のクロスフェード長[サンプル]
+
+
+class RawAudioStream:
+    """エピソード内の32ch生波形を連続ストリームとして貯めるバッファ。
+
+    シミュレータは更新のたびに「現在の音源位置で直近1秒」を独立に計算するため、
+    そのままでは連続波形にならない。各更新で新しく増えた分だけを取り出して連結し、
+    境界はクロスフェードで繋ぐことで、エピソード全体の連続波形を構成する。
+    """
+
+    def __init__(self, num_channels: int, initial_capacity: int = 1 << 18):
+        self.num_channels = num_channels
+        self._buf = np.zeros((num_channels, initial_capacity), dtype=np.float32)
+        self.length = 0
+
+    def reset(self):
+        self.length = 0
+
+    def _ensure(self, extra: int):
+        need = self.length + extra
+        if need <= self._buf.shape[1]:
+            return
+        capacity = self._buf.shape[1]
+        while capacity < need:
+            capacity *= 2
+        grown = np.zeros((self.num_channels, capacity), dtype=np.float32)
+        grown[:, : self.length] = self._buf[:, : self.length]
+        self._buf = grown
+
+    def append(self, chunk: np.ndarray, overlap: np.ndarray | None = None):
+        """新しい増分chunkを追記する。
+
+        overlapが与えられた場合、それは「既に書き出した末尾と同じ時刻区間」を
+        新しいシミュレーションで描き直したもの。両者をクロスフェードして
+        末尾を書き換えることで、音源位置の変化による段差を滑らかにする。
+        """
+        if overlap is not None and overlap.shape[1] > 0 and self.length >= overlap.shape[1]:
+            cf = overlap.shape[1]
+            weights = np.linspace(0.0, 1.0, cf, dtype=np.float32)[None, :]
+            tail = self._buf[:, self.length - cf : self.length]
+            self._buf[:, self.length - cf : self.length] = tail * (1.0 - weights) + overlap * weights
+        self._ensure(chunk.shape[1])
+        self._buf[:, self.length : self.length + chunk.shape[1]] = chunk
+        self.length += chunk.shape[1]
+
+    def data(self) -> np.ndarray:
+        return self._buf[:, : self.length]
+
+    def window(self, window_length: int) -> np.ndarray:
+        """直近window_lengthサンプルを返す（足りない分は先頭をゼロ埋め）。"""
+        out = np.zeros((self.num_channels, window_length), dtype=np.float32)
+        take = min(window_length, self.length)
+        if take > 0:
+            out[:, window_length - take :] = self._buf[:, self.length - take : self.length]
+        return out
+
 
 class SoundCamera:
     """音響シミュレーションとSoundMap生成を行うカメラクラス"""
@@ -141,7 +201,19 @@ class SoundCamera:
         self.signal_buffer = np.zeros(self.required_length, dtype=np.float32)
         self.audio_cursor = 0
         self.noise_audio_cursor = 0
-        
+
+        # 生波形ストリーム（use_raw_audio時のみ使用）
+        self.num_raw_audio_channels = config.mic_array_num * config.mics_per_array
+        self.raw_audio_stream = (
+            RawAudioStream(self.num_raw_audio_channels)
+            if config.use_raw_audio and self.num_raw_audio_channels > 0
+            else None
+        )
+        # 前回のシミュレーション以降に生成された音源サンプル数
+        self.pending_source_samples = 0
+        # 更新が一度でも走ったか（キャッシュ有効判定用）
+        self.has_cached_output = False
+
         # 速度履歴 (shake_mode/sound_all_mode用)
         # (velocity, num_samples) のリスト
         self.velocity_history = []
@@ -176,7 +248,51 @@ class SoundCamera:
         self.cached_spectrogram = None
         self.last_all_spectrograms = None
         self.noise_source_position = None
+        self.pending_source_samples = 0
+        self.has_cached_output = False
+        if self.raw_audio_stream is not None:
+            self.raw_audio_stream.reset()
         self.reset_nmf_state()
+
+    def get_audio_window(self) -> Optional[np.ndarray]:
+        """観測用の生波形 (num_channels, raw_audio_window) を返す。"""
+        if self.raw_audio_stream is None:
+            return None
+        return self.raw_audio_stream.window(self.config.raw_audio_window)
+
+    @property
+    def audio_stream_length(self) -> int:
+        return 0 if self.raw_audio_stream is None else self.raw_audio_stream.length
+
+    def get_audio_stream(self) -> Optional[np.ndarray]:
+        """エピソード全体の連続波形 (num_channels, N) を返す。"""
+        if self.raw_audio_stream is None:
+            return None
+        return self.raw_audio_stream.data()
+
+    def _record_raw_audio(self, mic_signals_list: List[np.ndarray]):
+        """今回のシミュレーション結果から、新しく増えた分だけをストリームに追記する。"""
+        if self.raw_audio_stream is None or not mic_signals_list:
+            return
+        full = np.concatenate(mic_signals_list, axis=0)[:, : self.required_length]
+        if full.shape[1] < self.required_length:
+            full = np.pad(full, ((0, 0), (self.required_length - full.shape[1], 0)))
+        full = full.astype(np.float32, copy=False)
+
+        # 初回は窓全体を、以降は前回シミュレーション以降の増分だけを採用する
+        if self.raw_audio_stream.length == 0:
+            new_samples = self.required_length
+        else:
+            new_samples = int(min(self.pending_source_samples, self.required_length))
+        if new_samples <= 0:
+            return
+
+        start = self.required_length - new_samples
+        chunk = full[:, start:]
+        crossfade = int(min(self.config.raw_audio_crossfade, start, self.raw_audio_stream.length))
+        overlap = full[:, start - crossfade : start] if crossfade > 0 else None
+        self.raw_audio_stream.append(chunk, overlap=overlap)
+        self.pending_source_samples = 0
 
     def reset_nmf_state(self):
         self._nmf_state = None
@@ -301,6 +417,9 @@ class SoundCamera:
         n_samples = int(dt * self.config.fs)
         if n_samples == 0:
             return
+
+        # 前回のシミュレーション以降に増えた音源サンプル数を記録（生波形ストリーム用）
+        self.pending_source_samples += n_samples
 
         # 1. 新しい音源チャンクを取得
         new_chunk = self._get_audio_chunk(n_samples)
@@ -446,7 +565,7 @@ class SoundCamera:
             # 移動部分は移動時音源、静止部分は元の音源
             signal_to_process = signal_to_process * (1.0 - blend_mask) + moving_chunk * blend_mask
         signal_for_simulation = signal_to_process[::-1]
-        if not should_update and self.cached_sound_map0 is not None:
+        if not should_update and self.has_cached_output:
             return self.cached_sound_map0, self.cached_sound_map1, self.cached_spectrogram
         # 音源位置の取得
         sound_pos = self.target.get_pos()
@@ -457,26 +576,43 @@ class SoundCamera:
         mic_signals_list = []
         music_results = []
         
+        # SoundMapはそれ自体が観測になる場合と、Spotforming(mode 0)のピーク探索に
+        # 使われる場合にのみ必要。生波形のみを取る設定ではMUSIC/NMFを丸ごと省ける。
+        needs_doa = (
+            self.config.use_soundmap
+            or self.config.spectrogram_all_modes
+            or (self.config.use_spectrogram and self.config.spectrogram_mode == 0)
+        )
+
         if self.config.mic_array_num > 0:
             # シミュレーション実行 (signalを渡す)
-            mic_signals_list, music_results = self._simulate_all_arrays(sound_pos, signal_for_simulation, zero_flag)
-            
-            for i in range(self.config.mic_array_num):
-                sound_map = self._generate_soundmap_from_doa(
-                    music_results[i],
-                    self.mic_positions[i]
-                )
-                sound_maps.append(sound_map)
+            mic_signals_list, music_results = self._simulate_all_arrays(
+                sound_pos, signal_for_simulation, zero_flag, compute_doa=needs_doa
+            )
+            self._record_raw_audio(mic_signals_list)
+
+            if needs_doa:
+                for i in range(self.config.mic_array_num):
+                    sound_map = self._generate_soundmap_from_doa(
+                        music_results[i],
+                        self.mic_positions[i]
+                    )
+                    sound_maps.append(sound_map)
         if not sound_maps:
-            print("Warning: All sound simulations failed or mic_array_num=0. Returning zero array.")
+            if needs_doa or self.config.mic_array_num == 0:
+                print("Warning: All sound simulations failed or mic_array_num=0. Returning zero array.")
             # 常に3チャンネルのゼロ画像を2つ返す
             sound_map_image = np.zeros(
                 (self.config.observation_height, self.config.observation_width, 3),
                 dtype=np.uint8
             )
             self.frames.append(sound_map_image)
+            self.cached_sound_map0 = sound_map_image
+            self.cached_sound_map1 = sound_map_image
+            self.cached_spectrogram = None
+            self.has_cached_output = True
             # sound_map0, sound_map1, spectrogram
-            return sound_map_image, sound_map_image, None 
+            return sound_map_image, sound_map_image, None
         sound_map_array = np.array(sound_maps).transpose(1, 2, 0)
         # ガウシアンフィルタの適用
         if self.config.use_gaussian_filter:
@@ -521,20 +657,24 @@ class SoundCamera:
         self.cached_sound_map0 = sound_map0
         self.cached_sound_map1 = sound_map1
         self.cached_spectrogram = spectrogram
-        
+        self.has_cached_output = True
+
         return sound_map0, sound_map1, spectrogram
     
     def _simulate_all_arrays(
         self,
         sound_pos: np.ndarray,
         signal: np.ndarray,
-        zero_flag: bool = False
+        zero_flag: bool = False,
+        compute_doa: bool = True,
     ) -> Tuple[List[np.ndarray], List[pra.doa.MUSIC]]:
         """
         すべてのマイクアレイを1つの部屋でシミュレーション
+        Args:
+            compute_doa: FalseならMUSIC推定を行わない（生波形のみ必要なとき用）
         Returns:
             mic_signals_list: 各マイクアレイの信号リスト
-            music_results: 各マイクアレイのMUSIC結果リスト
+            music_results: 各マイクアレイのMUSIC結果リスト（compute_doa=Falseなら空）
         """
         room_dim = [10, 10, self.config.room_height]
         room = pra.ShoeBox(room_dim, fs=self.config.fs, max_order=self.config.room_max_order)
@@ -559,6 +699,8 @@ class SoundCamera:
             end_idx = (i + 1) * self.config.mics_per_array
             signals = room.mic_array.signals[start_idx:end_idx]
             mic_signals_list.append(signals)
+        if not compute_doa:
+            return mic_signals_list, []
         if zero_flag:
             doa_mic_signals_list = [np.zeros_like(signals) for signals in mic_signals_list]
         else:

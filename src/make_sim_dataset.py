@@ -3,6 +3,8 @@ from PIL import Image
 import os
 import sys
 import copy
+import json
+from scipy.io import wavfile
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from env.genesis_env import GenesisEnv
 from env.tasks.normal import joints_name, AGENT_DIM
@@ -10,6 +12,82 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 saved_cube_pos = None
 is_first_call = True
+
+# 生波形をint16 WAVに書き出すときのフルスケール振幅。
+# 部屋シミュレーションのマイク信号は距離減衰で振幅が小さいため、
+# ここで基準を決めて全エピソード共通の線形量子化にする（エピソード間の音量差を保つ）。
+# 音源がマイクアレイに接近するケースで振幅20程度まで確認済み。6倍の余裕を取る。
+AUDIO_FULL_SCALE = 128.0
+
+
+class AudioWriter:
+    """エピソード単位で32ch生波形をWAVに保存し、正規化統計を集計する。"""
+
+    def __init__(self, dataset_root, sample_rate, num_channels, window, full_scale=AUDIO_FULL_SCALE):
+        self.audio_dir = os.path.join(dataset_root, "audio")
+        os.makedirs(self.audio_dir, exist_ok=True)
+        self.meta_path = os.path.join(dataset_root, "meta", "audio_info.json")
+        self.sample_rate = sample_rate
+        self.num_channels = num_channels
+        self.window = window
+        self.full_scale = full_scale
+        self.path_template = "audio/episode_{episode_index:06d}.wav"
+        # 統計（チャンネル毎）
+        self._count = 0
+        self._sum = np.zeros(num_channels, dtype=np.float64)
+        self._sum_sq = np.zeros(num_channels, dtype=np.float64)
+        self._peak = 0.0
+        self._clipped = 0
+        self._total_samples = 0
+
+    def write_episode(self, episode_index: int, stream: np.ndarray):
+        """stream: (num_channels, N) float32"""
+        assert stream.shape[0] == self.num_channels, (
+            f"expected {self.num_channels} channels, got {stream.shape[0]}"
+        )
+        self._count += stream.shape[1]
+        self._sum += stream.sum(axis=1, dtype=np.float64)
+        self._sum_sq += np.square(stream, dtype=np.float64).sum(axis=1)
+        self._peak = max(self._peak, float(np.abs(stream).max()) if stream.size else 0.0)
+        self._total_samples += stream.size
+
+        scaled = stream.T * (32767.0 / self.full_scale)
+        self._clipped += int(np.count_nonzero(np.abs(scaled) > 32767.0))
+        pcm = np.clip(scaled, -32768.0, 32767.0).astype(np.int16)
+        path = os.path.join(
+            self.audio_dir, os.path.basename(self.path_template.format(episode_index=episode_index))
+        )
+        wavfile.write(path, self.sample_rate, pcm)
+
+    def save_meta(self):
+        mean = (self._sum / max(self._count, 1)).astype(np.float32)
+        var = np.maximum(self._sum_sq / max(self._count, 1) - np.square(self._sum / max(self._count, 1)), 0.0)
+        std = np.sqrt(var).astype(np.float32)
+        # チャンネル間の音量差（=定位手がかり）を壊さないよう、正規化は全chで共通のスカラを使う
+        global_std = float(np.sqrt(np.mean(var))) if self._count else 1.0
+        info = {
+            "sample_rate": self.sample_rate,
+            "num_channels": self.num_channels,
+            "window": self.window,
+            "encoding": "pcm_16",
+            "full_scale": self.full_scale,
+            "path_template": self.path_template,
+            "stats": {
+                "mean": mean.tolist(),
+                "std": std.tolist(),
+                "global_std": global_std,
+            },
+            "peak": self._peak,
+            "clipped_samples": self._clipped,
+            "total_samples": self._total_samples,
+        }
+        with open(self.meta_path, "w") as f:
+            json.dump(info, f, indent=2)
+        print(
+            f"🎧 audio_info.json saved (peak={self._peak:.4f}, global_std={global_std:.5f}, "
+            f"clipped={self._clipped}/{self._total_samples})"
+        )
+        return info
 
 
 def build_balanced_episode_configs(task, episode_num):
@@ -184,10 +262,24 @@ def initialize_dataset(env: GenesisEnv, dataset_task_name=None) -> LeRobotDatase
         dataset_path = f"datasets/{task}_{dict_idx}"
     # env.observation_spaceの内容に基づいてfeaturesを定義
     features = {"action": {"dtype": "float32", "shape": (AGENT_DIM,), "names": joints_name}}
+    use_raw_audio = getattr(env._env, "sound_config", None) is not None and env._env.sound_config.use_raw_audio
+    if use_raw_audio:
+        # 生波形はparquetに入れず、エピソード単位のWAVに保存する。
+        # ここではフレームと波形を対応づけるインデックスと、正解の音源位置を保存する。
+        # "observation." を付けないのでポリシーの入力特徴には決して入らない。
+        features["sound_source_pos"] = {
+            "dtype": "float32", "shape": (3,), "names": ["x", "y", "z"],
+        }
+        features["audio_end_sample"] = {
+            "dtype": "int64", "shape": (1,), "names": None,
+        }
     for key, space in env.observation_space.spaces.items():
         # 全モード同時生成用の補助キーはデータセットには含めない
         # （各データセットの"spec"キーに対応モードの画像を書き込む）
         if key in ["observation.images.spec1", "observation.images.spec2"]:
+            continue
+        # 生波形は別ファイル（WAV）に保存する
+        if key == "observation.audio":
             continue
         if key == "observation.state":
             states_name = [
@@ -255,6 +347,21 @@ def main(
         datasets = [initialize_dataset(env)]
         spec_source_keys = ["observation.images.spec"]
     dataset = datasets[0]
+
+    use_raw_audio = env._env.sound_config.use_raw_audio if hasattr(env._env, "sound_config") else False
+    audio_writer = None
+    extra_frame_keys = []
+    if use_raw_audio:
+        assert not all_modes, "all_modes and raw audio collection cannot be combined"
+        sc = env._env.sound_config
+        audio_writer = AudioWriter(
+            dataset_root=str(dataset.root),
+            sample_rate=sc.fs,
+            num_channels=sc.mic_array_num * sc.mics_per_array,
+            window=sc.raw_audio_window,
+        )
+        extra_frame_keys = ["sound_source_pos", "audio_end_sample"]
+
     episode_configs = build_balanced_episode_configs(task, episode_num)
     ep = 0
     while ep < episode_num:
@@ -265,6 +372,11 @@ def main(
             env.reset(options=episode_config.get("reset_options"))
             obs_dict = {"action": []}
             for key in env.observation_space.spaces.keys():
+                # 生波形はエピソード単位のWAVに書くので、フレーム毎には貯めない
+                if key == "observation.audio":
+                    continue
+                obs_dict[key] = []
+            for key in extra_frame_keys:
                 obs_dict[key] = []
             save_flag = False
             
@@ -321,7 +433,16 @@ def main(
                 print(f"🚫 Skipping episode {ep+1}")
                 continue
             print(f"✅ Saving episode {ep+1}")
+            episode_index = ep
             ep += 1
+            if audio_writer is not None:
+                stream = env._env.sound_cam.get_audio_stream()
+                audio_writer.write_episode(episode_index, stream)
+                print(
+                    f"  🎧 audio: {stream.shape[1]} samples "
+                    f"({stream.shape[1] / env._env.sound_config.fs:.1f}s), "
+                    f"peak={np.abs(stream).max():.4f}"
+                )
             for m, ds in enumerate(datasets):
                 spec_key = spec_source_keys[m]
                 for i in range(len(obs_dict["action"])):
@@ -350,6 +471,10 @@ def main(
                 use_legacy_sound_config=use_legacy_sound_config,
             )
             continue
+    for ds in datasets:
+        ds.finalize()
+    if audio_writer is not None:
+        audio_writer.save_meta()
     env.close()
 if __name__ == "__main__":
     import argparse

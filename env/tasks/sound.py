@@ -125,6 +125,17 @@ class SoundTask(NormalTask):
                 dtype=np.uint8
             )
         
+        # 生波形（全マイクの生信号）
+        if self.sound_config.use_raw_audio:
+            obs_space_dict["observation.audio"] = spaces.Box(
+                low=-np.inf, high=np.inf,
+                shape=(
+                    self.sound_config.mic_array_num * self.sound_config.mics_per_array,
+                    self.sound_config.raw_audio_window,
+                ),
+                dtype=np.float32,
+            )
+
         # use_spectrogramがTrueの場合、specを追加（3チャンネル）
         if self.sound_config.use_spectrogram:
             obs_space_dict["observation.images.spec"] = spaces.Box(
@@ -297,7 +308,16 @@ class SoundTask(NormalTask):
         obs = super().get_obs()
         # SoundCameraからsound mapとスペクトログラムを取得
         sound_map0, sound_map1, spectrogram = self.sound_cam.render()
-        
+
+        # 生波形（直近raw_audio_windowサンプル）
+        if self.sound_config.use_raw_audio:
+            obs["observation.audio"] = self.sound_cam.get_audio_window()
+            # データセット収集用の付随情報（観測空間には含めない）
+            obs["sound_source_pos"] = self.get_sound_source_pos()
+            obs["audio_end_sample"] = np.array(
+                [self.sound_cam.audio_stream_length], dtype=np.int64
+            )
+
         # sound0とsound1を格納（両方とも3チャンネル）
         if self.sound_config.use_soundmap:
             assert sound_map0.ndim == 3 and sound_map0.shape[2] == 3, \
@@ -332,6 +352,13 @@ class SoundTask(NormalTask):
 
         return obs
     
+    def get_sound_source_pos(self):
+        """鳴っている音源（ターゲットCube）のワールド座標を返す。"""
+        pos = self.sound_cam.target.get_pos()
+        if hasattr(pos, "cpu"):
+            pos = pos.cpu().numpy()
+        return np.asarray(pos, dtype=np.float32).copy()
+
     def get_task_description(self):
         """
         タスクの説明を返す
